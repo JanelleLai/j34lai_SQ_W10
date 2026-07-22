@@ -1,5 +1,5 @@
 // ============================================================
-// Week 5 Example 3 — Maze with Animated Character and Coins
+// Week 10 Side Quest — Maze with Animated Character and Coins
 // ============================================================
 // This sketch combines everything from Examples 1 and 2:
 //   - Animated walking character (4 directions)
@@ -7,6 +7,10 @@
 //   - A hardcoded maze drawn with shapes
 //   - Wall collision to keep the player inside the maze
 //   - Collect all coins to unlock the exit
+//   - Space bar speed boost (3s duration / 5s recharge)
+//   - 60 second timer — running out sends the player back to start
+//   - Press Enter to restart after winning
+//   - Custom background image
 // ============================================================
 
 // ------------------------------------------------------------
@@ -46,6 +50,24 @@ const COIN = {
 };
 
 // ------------------------------------------------------------
+// BOOST CONFIGURATION
+// Durations are stored in frames, assuming p5's default 60fps.
+// ------------------------------------------------------------
+const BOOST = {
+  duration: 180, // 3 seconds * 60fps
+  cooldown: 300, // 5 seconds * 60fps
+  speedMultiplier: 2,
+};
+
+// ------------------------------------------------------------
+// TIMER CONFIGURATION
+// Uses millis() (real elapsed milliseconds) rather than frame
+// counts, so it stays accurate regardless of frame rate.
+// ------------------------------------------------------------
+const TIME_LIMIT = 60000; // 60 seconds, in milliseconds
+const FAIL_MESSAGE_DURATION = 90; // frames the "Time's up!" message stays visible (~1.5s at 60fps)
+
+// ------------------------------------------------------------
 // MAZE
 // A 2D array where each number represents one tile type.
 // The maze is 16 tiles wide and 10 tiles tall.
@@ -75,11 +97,11 @@ const MAZE = [
 
 // Colours for each tile type — stored as RGB arrays
 const TILE_COLORS = {
-  0: [40, 40, 50], // floor — dark grey
-  1: [80, 60, 100], // wall  — purple-grey
-  2: [40, 40, 50], // start — same as floor
-  3: [40, 40, 50], // coin  — same as floor (coin drawn on top)
-  4: [60, 100, 80], // exit  — green tint when locked
+  0: [40, 40, 50, 0], // floor — semi-transparent so background shows through
+  1: [255, 255, 255, 200], // wall  — fully opaque
+  2: [40, 40, 50, 0],
+  3: [40, 40, 50, 0],
+  4: [60, 100, 80, 255],
 };
 
 // ------------------------------------------------------------
@@ -91,7 +113,9 @@ const TILE_COLORS = {
 let player = {
   x: 0,
   y: 0,
-  speed: 2,
+  baseSpeed: 2,
+  boostSpeed: 2 * BOOST.speedMultiplier,
+  speed: 2, // current effective speed, updated by updateBoost()
 
   // Animation state
   currentFrame: 0,
@@ -99,11 +123,20 @@ let player = {
   direction: "down",
   isMoving: false,
 
+  // Boost state
+  boosting: false,
+  boostTimer: 0, // frames remaining while boost is active
+  boostCooldown: 0, // frames remaining until boost can be used again
+
   // Collision box half-dimensions
   // Smaller than the sprite so the player can navigate tight corridors
   hw: 12, // half width
   hh: 12, // half height
 };
+
+// Start tile position, saved in setup() — used to respawn the
+// player if the timer runs out or the game restarts
+let startPos = { x: 0, y: 0 };
 
 // ------------------------------------------------------------
 // COINS
@@ -118,18 +151,28 @@ let coinsCollected = 0;
 // ------------------------------------------------------------
 let gameWon = false;
 
+// Timer state
+let timerStart; // millis() timestamp when the current run began
+let failMessageTimer = 0; // counts down while "Time's up!" is showing
+
 // Images
 let characterSheet;
 let coinSheet;
+let backgroundImg;
+
+let bgMusic;
+let musicStarted = false;
 
 // ============================================================
 // preload()
-// Runs once before setup(). Loads both sprite sheets so they
+// Runs once before setup(). Loads all image assets so they
 // are ready before the sketch tries to use them.
 // ============================================================
 function preload() {
   characterSheet = loadImage("assets/images/walking.png");
   coinSheet = loadImage("assets/images/coin_gold.png");
+  backgroundImg = loadImage("assets/images/background.png");
+  bgMusic = loadSound("assets/sounds/bgmusic.mp3");
 }
 
 // ============================================================
@@ -153,6 +196,10 @@ function setup() {
         // Place the player in the centre of the start tile
         player.x = col * TILE_SIZE + TILE_SIZE / 2;
         player.y = row * TILE_SIZE + TILE_SIZE / 2;
+
+        // Remember this position so we can respawn here later
+        startPos.x = player.x;
+        startPos.y = player.y;
       }
 
       if (tile === 3) {
@@ -168,20 +215,28 @@ function setup() {
       }
     }
   }
+
+  // Start the 60 second countdown
+  timerStart = millis();
 }
 
 // ============================================================
 // draw()
 // Runs repeatedly in a loop after setup() finishes.
-// Order matters — maze is drawn first so everything else
-// appears on top of it.
+// Order matters — background/maze are drawn first so
+// everything else appears on top of them.
 // ============================================================
 function draw() {
-  background(20);
+  // Draw the background image stretched to fill the whole canvas.
+  // imageMode(CENTER) is set in setup(), so this draws it centred
+  // at width/2, height/2 scaled to the full canvas size.
+  image(backgroundImg, width / 2, height / 2, width, height);
 
   drawMaze();
   updateCoins();
   drawCoins();
+  updateBoost();
+  updateTimer();
   handleInput();
   resolveWallCollisions();
   checkCoinCollection();
@@ -190,10 +245,162 @@ function draw() {
   drawCharacter();
   drawHUD();
 
+  // Fail message draws on top of gameplay but win screen (if any) draws over it
+  if (failMessageTimer > 0) {
+    drawFailMessage();
+    failMessageTimer--;
+  }
+
   // Win screen is drawn last so it appears on top of everything
   if (gameWon) {
     drawWinScreen();
   }
+}
+
+// ------------------------------------------------------------
+// keyPressed()
+// p5 built-in callback — fires exactly once per key press,
+// unlike keyIsDown() which fires every frame the key is held.
+// Space triggers the boost; Enter restarts the game once won.
+// ------------------------------------------------------------
+function keyPressed() {
+  if (!musicStarted) {
+    bgMusic.setVolume(0.4);
+    bgMusic.loop();
+    musicStarted = true;
+  }
+
+  if (keyCode === 32) {
+    // Space bar
+    activateBoost();
+  }
+
+  if (keyCode === 13) {
+    // Enter — only does anything once the game has been won
+    if (gameWon) {
+      restartGame();
+    }
+  }
+}
+
+// ------------------------------------------------------------
+// activateBoost()
+// Starts the boost if it isn't already active and isn't on
+// cooldown. Ignored otherwise (e.g. mashing space does nothing
+// until the cooldown finishes).
+// ------------------------------------------------------------
+function activateBoost() {
+  if (gameWon) return;
+  if (player.boosting) return;
+  if (player.boostCooldown > 0) return;
+
+  player.boosting = true;
+  player.boostTimer = BOOST.duration;
+}
+
+// ------------------------------------------------------------
+// updateBoost()
+// Ticks the boost and cooldown timers down each frame and
+// keeps player.speed in sync with the current state.
+// ------------------------------------------------------------
+function updateBoost() {
+  if (player.boosting) {
+    player.boostTimer--;
+    player.speed = player.boostSpeed;
+
+    if (player.boostTimer <= 0) {
+      player.boosting = false;
+      player.boostCooldown = BOOST.cooldown;
+      player.speed = player.baseSpeed;
+    }
+  } else if (player.boostCooldown > 0) {
+    player.boostCooldown--;
+    player.speed = player.baseSpeed;
+  } else {
+    player.speed = player.baseSpeed;
+  }
+}
+
+// ------------------------------------------------------------
+// updateTimer()
+// Checks how much time has elapsed since timerStart. Once the
+// player has run out of time, sends them back to the start
+// tile and resets the clock for another attempt.
+// Stops counting once the game is won.
+// ------------------------------------------------------------
+function updateTimer() {
+  if (gameWon) return;
+
+  let elapsed = millis() - timerStart;
+  if (elapsed >= TIME_LIMIT) {
+    failRun();
+  }
+}
+
+// ------------------------------------------------------------
+// getTimeRemaining()
+// Returns the seconds left on the clock, clamped to 0 so the
+// HUD never displays a negative number.
+// ------------------------------------------------------------
+function getTimeRemaining() {
+  let elapsed = millis() - timerStart;
+  let remainingMs = max(0, TIME_LIMIT - elapsed);
+  return remainingMs / 1000;
+}
+
+// ------------------------------------------------------------
+// failRun()
+// Called when the countdown reaches zero. Sends the player
+// back to the starting tile, resets movement/animation state
+// so they don't spawn mid-stride, and restarts the timer.
+// Note: collected coins stay collected — only position and
+// time reset, so the player doesn't lose prior progress.
+// ------------------------------------------------------------
+function failRun() {
+  player.x = startPos.x;
+  player.y = startPos.y;
+  player.direction = "down";
+  player.isMoving = false;
+  player.currentFrame = 0;
+  player.frameTimer = 0;
+
+  timerStart = millis();
+  failMessageTimer = FAIL_MESSAGE_DURATION;
+}
+
+// ------------------------------------------------------------
+// restartGame()
+// Called after a win, when the player presses Enter.
+// Fully resets the run: player position/state, boost state,
+// every coin back to uncollected, the timer, and gameWon.
+// ------------------------------------------------------------
+function restartGame() {
+  // Reset player position and movement/animation state
+  player.x = startPos.x;
+  player.y = startPos.y;
+  player.direction = "down";
+  player.isMoving = false;
+  player.currentFrame = 0;
+  player.frameTimer = 0;
+
+  // Reset boost state completely — fresh boost available immediately
+  player.speed = player.baseSpeed;
+  player.boosting = false;
+  player.boostTimer = 0;
+  player.boostCooldown = 0;
+
+  // Reset every coin back to uncollected
+  for (let i = 0; i < coins.length; i++) {
+    coins[i].collected = false;
+    coins[i].frame = floor(random(COIN.numFrames));
+    coins[i].frameTimer = 0;
+  }
+  coinsCollected = 0;
+
+  // Reset game state and timers
+  gameWon = false;
+  failMessageTimer = 0;
+  timerStart = millis();
 }
 
 // ------------------------------------------------------------
@@ -220,7 +427,7 @@ function drawMaze() {
         }
       } else {
         let c = TILE_COLORS[tile];
-        fill(c[0], c[1], c[2]);
+        fill(c[0], c[1], c[2], c[3]);
       }
 
       rect(col * TILE_SIZE, row * TILE_SIZE, TILE_SIZE, TILE_SIZE);
@@ -282,6 +489,7 @@ function drawCoins() {
 // Moves the player and sets the correct facing direction.
 // Each direction is checked independently so diagonal
 // movement works naturally — holding W and D moves up-right.
+// Uses player.speed, which updateBoost() adjusts each frame.
 // Returns early if the game is already won.
 // ------------------------------------------------------------
 function handleInput() {
@@ -483,11 +691,12 @@ function drawCharacter() {
 // ------------------------------------------------------------
 // drawHUD()
 // HUD = Heads Up Display.
-// Shows coin count and exit status at the top of the screen.
+// Shows coin count, exit status, boost availability, and the
+// countdown timer at the top of the screen.
 // ------------------------------------------------------------
 function drawHUD() {
   noStroke();
-  fill(255);
+  fill(0);
   textSize(14);
   textAlign(LEFT);
   textFont("monospace");
@@ -498,6 +707,95 @@ function drawHUD() {
     fill(30, 200, 120);
     text("Exit is open! Find the green tile.", 10, 40);
   }
+
+  drawBoostBar();
+  drawTimer();
+}
+
+// ------------------------------------------------------------
+// drawBoostBar()
+// Small status bar showing boost state:
+//   - Full green bar: boost ready (tap space)
+//   - Shrinking grey bar: boost active, draining
+//   - Filling red-to-green bar: on cooldown, recharging
+// ------------------------------------------------------------
+function drawBoostBar() {
+  let barX = 10;
+  let barY = 50;
+  let barW = 100;
+  let barH = 10;
+
+  // Background track
+  noStroke();
+  fill(60);
+  rect(barX, barY, barW, barH);
+
+  let fillRatio = 1;
+  let barColor = [30, 200, 120]; // ready — green
+  let label = "Boost: READY (space)";
+
+  if (player.boosting) {
+    fillRatio = player.boostTimer / BOOST.duration;
+    barColor = [220, 220, 100]; // active — yellow
+    label = "Boost: ACTIVE";
+  } else if (player.boostCooldown > 0) {
+    fillRatio = 1 - player.boostCooldown / BOOST.cooldown;
+    barColor = [200, 80, 80]; // recharging — red
+    label = "Boost: recharging";
+  }
+
+  fill(barColor[0], barColor[1], barColor[2]);
+  rect(barX, barY, barW * fillRatio, barH);
+
+  fill(0);
+  textSize(12);
+  text(label, barX, barY + 24);
+}
+
+// ------------------------------------------------------------
+// drawTimer()
+// Displays the countdown in the top right corner as M:SS.
+// Turns red in the last 10 seconds as a warning.
+// ------------------------------------------------------------
+function drawTimer() {
+  let secondsLeft = getTimeRemaining();
+  let minutes = floor(secondsLeft / 60);
+  let seconds = floor(secondsLeft % 60);
+  let display = minutes + ":" + (seconds < 10 ? "0" + seconds : seconds);
+
+  noStroke();
+  if (secondsLeft <= 10 && !gameWon) {
+    fill(220, 60, 60); // warning red
+  } else {
+    fill(0); // changed from fill(255) to black
+  }
+  textSize(18);
+  textAlign(RIGHT);
+  textFont("monospace");
+  text("Time: " + display, width - 10, 24);
+  textAlign(LEFT); // reset alignment for other HUD text
+}
+
+// ------------------------------------------------------------
+// drawFailMessage()
+// Briefly shown after the timer runs out, letting the player
+// know why they were sent back to the start.
+// ------------------------------------------------------------
+function drawFailMessage() {
+  fill(0, 0, 0, 140);
+  rectMode(CORNER);
+  rect(0, 0, width, height);
+
+  fill(220, 60, 60);
+  textAlign(CENTER);
+  textSize(36);
+  text("Time's Up!", width / 2, height / 2 - 10);
+
+  textSize(16);
+  fill(230);
+  text("Back to the start — try again", width / 2, height / 2 + 20);
+
+  textAlign(LEFT); // reset alignment for other HUD text
 }
 
 // ------------------------------------------------------------
@@ -519,4 +817,8 @@ function drawWinScreen() {
   textSize(16);
   fill(180);
   text("All coins collected", width / 2, height / 2 + 20);
+
+  fill(220, 220, 100);
+  textSize(18);
+  text("Press ENTER to play again", width / 2, height / 2 + 50);
 }
