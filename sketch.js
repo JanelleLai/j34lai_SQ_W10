@@ -720,8 +720,8 @@ function drawHUD() {
 //   - Filling red-to-green bar: on cooldown, recharging
 // ------------------------------------------------------------
 function drawBoostBar() {
-  let barX = 10;
-  let barY = 50;
+  let barX = 20;
+  let barY = 460;
   let barW = 100;
   let barH = 10;
 
